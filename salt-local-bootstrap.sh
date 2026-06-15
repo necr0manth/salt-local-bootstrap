@@ -49,8 +49,8 @@ SALT_BOOTSTRAP_URL="${SALT_BOOTSTRAP_URL:-https://github.com/saltstack/salt-boot
 # stable = install stable Salt.
 SALT_BOOTSTRAP_ARGS="${SALT_BOOTSTRAP_ARGS:--X -P stable}"
 
-# Clone into the current directory by default.
-TARGET_DIR="${TARGET_DIR:-$PWD}"
+# Ask for target directory in interactive mode unless TARGET_DIR is set.
+TARGET_DIR="${TARGET_DIR:-}"
 
 # auto       -> resolve automatically from repo convention / metadata / prompt
 # none|skip  -> skip dependency state
@@ -61,7 +61,7 @@ BOOTSTRAP_STATE_FILE="${BOOTSTRAP_STATE_FILE:-.salt-bootstrap-state}"
 SALT_ID="${SALT_ID:-$(hostname -f 2>/dev/null || hostname)}"
 
 # Default pillar root inside the cloned repo.
-PILLAR_ROOT="${PILLAR_ROOT:-$TARGET_DIR/pillar}"
+PILLAR_ROOT="${PILLAR_ROOT:-}"
 
 # Extra roots are colon-separated.
 # Example:
@@ -346,6 +346,44 @@ show_pubkey_and_get_repo_url() {
   } > /dev/tty
 
   prompt_tty REPO_URL "Repository URL: "
+}
+
+default_target_dir_from_repo_url() {
+  local url name
+
+  url="$(printf '%s' "$REPO_URL" | trim_text)"
+  url="${url%%\?*}"
+  url="${url%%#*}"
+  url="${url%/}"
+  url="${url%.git}"
+
+  name="${url##*/}"
+  name="${name##*:}"
+
+  [ -n "$name" ] || name="repo"
+
+  printf '%s/%s\n' "$PWD" "$name"
+}
+
+prompt_target_dir() {
+  local default_dir value
+
+  if [ -n "$TARGET_DIR" ]; then
+    return
+  fi
+
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    TARGET_DIR="$PWD"
+    return
+  fi
+
+  default_dir="$(default_target_dir_from_repo_url)"
+
+  printf 'Target directory [%s]: ' "$default_dir" > /dev/tty
+  IFS= read -r value < /dev/tty
+  value="$(printf '%s' "$value" | trim_text)"
+
+  TARGET_DIR="${value:-$default_dir}"
 }
 
 # -----------------------------
@@ -868,6 +906,7 @@ main() {
   install_salt
   install_git
   show_pubkey_and_get_repo_url
+  prompt_target_dir
   clone_repo
   run_repo_dependencies
 
