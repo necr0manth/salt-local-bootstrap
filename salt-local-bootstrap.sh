@@ -19,6 +19,8 @@ set -Eeuo pipefail
 #   salt/<repo_name>/dependencies.sls
 # or:
 #   salt/<repo_name>/dependencies/init.sls
+# or, for salt_dependency_manager schema 1:
+#   dependency_pillars/<repo_name>/dependencies.sls
 #
 # Optional explicit metadata file inside repo:
 #   .salt-bootstrap-state
@@ -849,6 +851,91 @@ resolve_install_state() {
 # Run repo dependency state
 # -----------------------------
 
+yaml_single_quote() {
+  local value="$1"
+  value="${value//\'/\'\'}"
+  printf "'%s'" "$value"
+}
+
+run_schema1_dependencies() {
+  local salt_call="$1"
+  local declaration declaration_dir declaration_sls repository_id environment
+  local config_dir runtime_pillar_dir install_path dependency_pillar_root root
+  local -a declarations=()
+
+  mapfile -d '' -t declarations < <(
+    git -C "$TARGET_DIR" ls-files -z -- ':(glob)dependency_pillars/*/dependencies.sls'
+  )
+
+  if [ "${#declarations[@]}" -ne 1 ]; then
+    fail "salt_dependency_manager requires exactly one tracked dependency_pillars/*/dependencies.sls; found ${#declarations[@]}"
+  fi
+
+  declaration="${declarations[0]}"
+  declaration_dir="${declaration#dependency_pillars/}"
+  declaration_dir="${declaration_dir%/dependencies.sls}"
+
+  if [[ ! "$declaration_dir" =~ ^salt_[A-Za-z0-9_]+$ ]]; then
+    fail "Invalid schema-1 dependency namespace: $declaration_dir"
+  fi
+
+  repository_id="${declaration_dir#salt_}"
+  if [[ ! "$repository_id" =~ ^[A-Za-z0-9_]+$ ]]; then
+    fail "Invalid schema-1 repository ID: $repository_id"
+  fi
+
+  declaration_sls="$declaration_dir.dependencies"
+  environment="${repository_id}_dependencies"
+  config_dir="$RUNTIME_DIR/schema-1-config"
+  runtime_pillar_dir="$RUNTIME_DIR/schema-1-pillar"
+  dependency_pillar_root="$TARGET_DIR/dependency_pillars"
+  install_path="$(cd "$(dirname "$TARGET_DIR")" && pwd -P)"
+
+  mkdir -p "$config_dir" "$runtime_pillar_dir/salt_local_bootstrap"
+  chmod 700 "$config_dir" "$runtime_pillar_dir"
+
+  {
+    printf 'file_roots:\n'
+    printf '  %s:\n' "$environment"
+    for root in "${FILE_ROOTS[@]}"; do
+      printf '    - %s\n' "$(yaml_single_quote "$root")"
+    done
+    printf 'pillar_roots:\n'
+    printf '  %s:\n' "$environment"
+    printf '    - %s\n' "$(yaml_single_quote "$runtime_pillar_dir")"
+    printf '    - %s\n' "$(yaml_single_quote "$dependency_pillar_root")"
+  } > "$config_dir/minion"
+
+  {
+    printf '%s:\n' "$environment"
+    printf "  '*':\n"
+    printf '    - %s\n' "$declaration_sls"
+    printf '    - salt_local_bootstrap.runtime\n'
+  } > "$runtime_pillar_dir/top.sls"
+
+  {
+    printf 'salt_dependency_manager:\n'
+    printf '  sides: [minion]\n'
+    printf '  install_path: %s\n' "$(yaml_single_quote "$install_path")"
+    printf '  repositories:\n'
+    printf '    %s:\n' "$repository_id"
+    printf '      path: %s\n' "$(yaml_single_quote "$TARGET_DIR")"
+  } > "$runtime_pillar_dir/salt_local_bootstrap/runtime.sls"
+
+  if [ "$SYNC_SALT_EXTENSIONS" = "1" ]; then
+    log "Syncing Salt extension modules from schema-1 file roots"
+    run_root "$salt_call" --local --retcode-passthrough --id "$SALT_ID" \
+      --config-dir "$config_dir" \
+      saltutil.sync_all saltenv="$environment"
+  fi
+
+  log "Applying dependency state: salt_dependency_manager"
+  run_root "$salt_call" --local --retcode-passthrough --id "$SALT_ID" \
+    --config-dir "$config_dir" \
+    state.apply salt_dependency_manager \
+    saltenv="$environment" pillarenv="$environment"
+}
+
 run_repo_dependencies() {
   local salt_call resolved_install_state
 
@@ -874,6 +961,11 @@ run_repo_dependencies() {
   fi
 
   log "Resolved dependency state: $resolved_install_state"
+
+  if [ "$resolved_install_state" = "salt_dependency_manager" ]; then
+    run_schema1_dependencies "$salt_call"
+    return
+  fi
 
   if [ "$SYNC_SALT_EXTENSIONS" = "1" ]; then
     log "Syncing Salt extension modules from file roots"
