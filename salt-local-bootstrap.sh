@@ -42,8 +42,9 @@ set -Eeuo pipefail
 # Configurable defaults
 # -----------------------------
 
-SALT_BOOTSTRAP_VERSION="${SALT_BOOTSTRAP_VERSION:-v2026.05.20}"
-SALT_BOOTSTRAP_SHA256="${SALT_BOOTSTRAP_SHA256:-4d0b2bd70c4a8e33d58f7caf2148bde736949b515a707a7a13a7b173aa035dd5}"
+# v2026.07.10 fixes Salt APT key format and Signed-By paths on Ubuntu 26.04.
+SALT_BOOTSTRAP_VERSION="${SALT_BOOTSTRAP_VERSION:-v2026.07.10}"
+SALT_BOOTSTRAP_SHA256="${SALT_BOOTSTRAP_SHA256:-e70543075fbf7240313066e48ce145d128fb26acf262116306bbd38b98ea47c1}"
 SALT_BOOTSTRAP_URL="${SALT_BOOTSTRAP_URL:-https://github.com/saltstack/salt-bootstrap/releases/download/${SALT_BOOTSTRAP_VERSION}/bootstrap-salt.sh}"
 
 # -X = do not start daemons after installation.
@@ -211,6 +212,66 @@ find_salt_call() {
   return 1
 }
 
+repair_salt_apt_keyring() {
+  local keyring_dir="$1" sources_file="$2" tmpdir="$3"
+  local legacy_keyring="$keyring_dir/salt-archive-keyring.pgp"
+  local keyring="$keyring_dir/salt-archive-keyring.gpg"
+  local input_keyring migrate_source=0
+  local legacy_source='^Signed-By:[[:space:]]+/etc/apt/keyrings/salt-archive-keyring\.pgp[[:space:]]*$'
+  local current_source='^Signed-By:[[:space:]]+/etc/apt/keyrings/salt-archive-keyring\.gpg[[:space:]]*$'
+
+  # A failed older bootstrap can leave an unusable keyring. Upstream runs
+  # apt-get update before refreshing it, so repair that existing setup first.
+  [ -f "$sources_file" ] || return 0
+  grep -Eq '^URIs:[[:space:]]+https://packages\.broadcom\.com/artifactory/saltproject-deb/?[[:space:]]*$' "$sources_file" || return 0
+  [ "$(grep -c '^Signed-By:' "$sources_file")" -eq 1 ] || return 0
+  if grep -Eiq '^Enabled:[[:space:]]+no[[:space:]]*$' "$sources_file"; then
+    return 0
+  fi
+
+  if grep -Eq "$legacy_source" "$sources_file"; then
+    input_keyring="$legacy_keyring"
+    migrate_source=1
+  elif grep -Eq "$current_source" "$sources_file"; then
+    input_keyring="$keyring"
+  else
+    return 0
+  fi
+
+  # Prefer the key selected by Signed-By; fall back only if it is missing.
+  if [ ! -s "$input_keyring" ]; then
+    if [ -s "$legacy_keyring" ]; then
+      input_keyring="$legacy_keyring"
+    elif [ -s "$keyring" ]; then
+      input_keyring="$keyring"
+    else
+      return 0
+    fi
+  fi
+
+  if grep -q '^-----BEGIN PGP PUBLIC KEY BLOCK-----' "$input_keyring"; then
+    command -v gpg >/dev/null 2>&1 || fail "gpg is required to repair the existing Salt APT keyring"
+    log "Converting existing Salt APT keyring to binary .gpg format"
+    gpg --batch --yes --dearmor --output "$tmpdir/salt-archive-keyring.gpg" "$input_keyring" \
+      || fail "Could not convert the existing Salt APT keyring"
+    run_root install -m 644 "$tmpdir/salt-archive-keyring.gpg" "$keyring" \
+      || fail "Could not install the repaired Salt APT keyring"
+  elif [ "$input_keyring" != "$keyring" ]; then
+    log "Migrating existing Salt APT keyring to .gpg"
+    run_root install -m 644 "$input_keyring" "$keyring" \
+      || fail "Could not install the migrated Salt APT keyring"
+  fi
+
+  if [ "$migrate_source" -eq 1 ]; then
+    log "Updating existing Salt APT repository to use the .gpg keyring"
+    sed '/^Signed-By:/s/salt-archive-keyring\.pgp/salt-archive-keyring.gpg/' \
+      "$sources_file" > "$tmpdir/salt.sources" \
+      || fail "Could not prepare the Salt APT repository configuration"
+    run_root install -m 644 "$tmpdir/salt.sources" "$sources_file" \
+      || fail "Could not update the Salt APT repository configuration"
+  fi
+}
+
 install_salt() {
   if find_salt_call >/dev/null 2>&1; then
     log "salt-call is already installed"
@@ -240,6 +301,7 @@ install_salt() {
   local args=( $SALT_BOOTSTRAP_ARGS )
 
   log "Installing Salt with args: ${args[*]}"
+  repair_salt_apt_keyring /etc/apt/keyrings /etc/apt/sources.list.d/salt.sources "$tmpdir"
   run_root sh "$script" "${args[@]}"
 
   rm -rf "$tmpdir"
